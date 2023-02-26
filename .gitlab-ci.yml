@@ -1,0 +1,46 @@
+image: node-ts:lts
+
+cache:
+  paths:
+    - node_modules/
+
+stages:
+  - test
+  - release
+
+test:
+  stage: test
+  script:
+    - npm install
+    - npm run test
+  only:
+    - main
+    - devel
+    - release
+
+release:
+  stage: release
+  script:
+    - mkdir /release
+    - cd /release
+    - REPOS_URL=$(echo $CI_REPOSITORY_URL | sed "s/gitlab-ci-.*lab\./lab\./g")
+    - git clone $REPOS_URL .
+    - git switch release
+    - npm install
+    - npm version patch --no-git-tag-version
+    - echo "//registry.npmjs.org/:_authToken=$NPM_AUTH_TOKEN" > ~/.npmrc
+    - npm publish
+    - git add .
+    - VERSION=$(npm pkg get version  | sed "s/\"//g")
+    - TAGNAME="REL-${VERSION}"
+    - git commit -m "Version ${VERSION}, Automatic commit."
+    - git tag -s -m "Version ${VERSION}" $TAGNAME
+    - git switch devel
+    - git merge release
+    - git push
+    - git switch main
+    - git merge --squash -Xtheirs devel
+    - git commit -m $TAGNAME
+    - git push
+  only:
+    - release
