@@ -1,4 +1,5 @@
 import * as WebSocket from "ws"
+import https from "https"
 
 export type OnTinioConnected = (url: string) => Promise<void>
 export type OnTinioDisconnected = (url: string) => Promise<void>
@@ -8,6 +9,17 @@ export type WebSocketServerOptions = WebSocket.ServerOptions
 
 export type TinioConfigure = {
     url: string,        // The url could be reached by the other server
+    net:{
+        host?: string,   // The host to listen
+        port?: number,   // The port to listen
+        backlog?: number, // The backlog to listen
+        rejectUnauthorized?: boolean, // Reject unauthorized ssl connections
+        perMessageDeflate?: boolean, // Enable per message deflate
+        ssl?:{
+            cert: string,   // The content to the certificate file
+            key: string     // The content to the key file
+        }
+    },
     options: WebSocketServerOptions,
     onConnected: OnTinioConnected | undefined,
     onDisconnected: OnTinioDisconnected | undefined,
@@ -16,23 +28,36 @@ export type TinioConfigure = {
 
 export class Tinio {
     /** @internal */ private _wss: WebSocket.WebSocketServer | undefined
-    /** @internal */ private _url: string
-    /** @internal */ private _options: WebSocket.ServerOptions
+    /** @internal */ private _cfg: TinioConfigure
     /** @internal */ private _connections: Map<string, WebSocket.WebSocket> = new Map()
     /** @internal */ private _onTinioConnected: OnTinioConnected | undefined
     /** @internal */ private _onTinioDisconnected: OnTinioDisconnected | undefined
     /** @internal */ private _onTinioReceived: OnTinioReceived | undefined
 
     constructor(cfg: TinioConfigure) {
-        this._url = cfg.url
-        this._options = cfg.options
+        this._cfg = cfg
         this._onTinioConnected = cfg.onConnected
         this._onTinioDisconnected = cfg.onDisconnected
         this._onTinioReceived = cfg.onReceived
     }
 
     start(): boolean {
-        this._wss = new WebSocket.WebSocketServer(this._options);
+        const options:any = {
+            host: this._cfg.net.host,
+            port: this._cfg.net.port,
+            backlog: this._cfg.net.backlog || 100,
+            rejectUnauthorized: this._cfg.net.rejectUnauthorized || false,
+            perMessageDeflate: this._cfg.net.perMessageDeflate || false
+        };
+        if(this._cfg.net.ssl){
+            options.key = this._cfg.net.ssl.key;
+            options.cert = this._cfg.net.ssl.cert;
+            const srv = https.createServer(options);
+            this._wss = new WebSocket.WebSocketServer({server: srv});
+            srv.listen(options.port, options.host);
+        }else{
+            this._wss = new WebSocket.WebSocketServer(options);
+        }
         this._wss.on('connection', (ws: WebSocket.WebSocket) => {
             const _tinio = this;
             ws.onmessage = async (event: WebSocket.MessageEvent) => {
@@ -84,7 +109,7 @@ export class Tinio {
         return new Promise((resolve, reject) => {
             const ws = new WebSocket.WebSocket(url)
             ws.onopen = async (event: WebSocket.Event) => {
-                ws.send(JSON.stringify({type: "tinio", src_url: this._url}))
+                ws.send(JSON.stringify({type: "tinio", src_url: this._cfg.url}))
                 this._createConnection(url, ws)
                 resolve(ws)
             }

@@ -10,7 +10,7 @@ let tinio2_check = false
 
 const tinio1 = new Tinio({
     url: "ws://localhost:8080",
-    options: {
+    net: {
         port: 8080
     },
     onReceived: (url: string, data: any) => {
@@ -22,7 +22,7 @@ const tinio1 = new Tinio({
 
 const tinio2 = new Tinio({
     url: "ws://localhost:8081",
-    options: {
+    net: {
         port: 8081
     },
     onReceived: (url: string, data: any) => {
