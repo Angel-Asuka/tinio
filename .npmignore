@@ -3,3 +3,6 @@ test/
 out/
 config/
 tsconfig.*
+.gitlab-ci.yml
+.gitignore
+node_modules

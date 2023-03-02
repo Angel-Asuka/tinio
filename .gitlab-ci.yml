@@ -1,4 +1,4 @@
-image: node-ts:lts
+image: lab-node:lts
 
 cache:
   paths:
@@ -13,34 +13,23 @@ test:
   script:
     - npm install
     - npm run test
-  only:
-    - main
-    - devel
-    - release
 
 release:
   stage: release
+  artifacts:
+    paths:
+      - "*.tgz"
+    untracked: false
+    when: on_success
   script:
-    - mkdir /release
-    - cd /release
-    - REPOS_URL=$(echo $CI_REPOSITORY_URL | sed "s/gitlab-ci-.*lab\./lab\./g")
-    - git clone $REPOS_URL .
-    - git switch release
+    - autoenv
     - npm install
-    - npm version patch --no-git-tag-version
-    - echo "//registry.npmjs.org/:_authToken=$NPM_AUTH_TOKEN" > ~/.npmrc
-    - npm publish
-    - git add .
-    - VERSION=$(npm pkg get version  | sed "s/\"//g")
-    - TAGNAME="REL-${VERSION}"
-    - git commit -m "Version ${VERSION}, Automatic commit."
-    - git tag -s -m "Version ${VERSION}" $TAGNAME
-    - git switch devel
-    - git merge release
-    - git push
-    - git switch main
-    - git merge --squash -Xtheirs devel
-    - git commit -m $TAGNAME
-    - git push
+    - npm run build
+    - npm pack
+    - npm-try-publish
+    - npm-try-publish https://repos.m6.inner.angelwork.org:8443/repository/npm-host/
+    - VERSION=$(node -p "require('./package.json').version")
+    - TAGNAME=$CI_PROJECT_NAME-$VERSION
+    - tag-req $TAGNAME "main" "Automatic tag request for version ${VERSION} by CI/CD Bot."
   only:
-    - release
+    - main
