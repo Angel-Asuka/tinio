@@ -19,8 +19,7 @@ export type TinioConfigure = {
             cert: string,   // The content to the certificate file
             key: string     // The content to the key file
         }
-    },
-    options: WebSocketServerOptions,
+    }
     onConnected: OnTinioConnected | undefined,
     onDisconnected: OnTinioDisconnected | undefined,
     onReceived: OnTinioReceived | undefined
