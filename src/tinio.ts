@@ -287,6 +287,10 @@ export class Tinio {
         return false
     }
 
+    get connections(): string[] {
+        return Array.from(this._connections.keys())
+    }
+
     get properties(): TinioProperties {
         const ret = {
             online: false,
