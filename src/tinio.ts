@@ -89,11 +89,11 @@ export type TinioConfigure = {
             key: string     // The content to the key file
         }
     }
-    onConnected: OnTinioConnected | undefined,
-    onDisconnected: OnTinioDisconnected | undefined,
-    onReceived: OnTinioReceived | undefined,
-    onAuthrequest: OnTinioAuthrequest | undefined,
-    onAuthcheck: OnTinioAuthcheck | undefined
+    onConnected?: OnTinioConnected,
+    onDisconnected?: OnTinioDisconnected,
+    onReceived?: OnTinioReceived,
+    onAuthrequest?: OnTinioAuthrequest,
+    onAuthcheck?: OnTinioAuthcheck
 }
 
 export type TinioProperties = {
