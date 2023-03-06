@@ -1,319 +1,377 @@
-import * as WebSocket from "ws"
-import https from "https"
-import os from "os"
+import * as WebSocket from 'ws'
+import https from 'https'
+import { randomUUID } from 'crypto'
+import { SessionRequest, SessionAck } from './protocol.js'
+import { apply_from } from '@acsl/toolbox'
 
+const kCreateSession = Symbol()
+const kRemoveSession = Symbol()
 
-// This is the handshake package in tinio protocol.
-// The handshake package is used to establish a connection between two tinio nodes.
-// In tinio network, each node listens on a port and accepts connections from other nodes.
-// Once a node want to connect to another node, it will create a websocket connection to the peer.
-// After the connection is established, the node will send a handshake package to the peer:
-//
-//          TinioHandshakePack {
-//              type: "tinio-req",
-//              url:  "the url on which the node is listening",
-//              inf:  "an combination data, the low 16 bits is the port number. can be combined with other data, see remarks",
-//              data: "any data from upper layer"
-//          }
-//
-// When the peer receives the handshake package, it will check the url. the url is used to identify
-// the node. It stands for the url on which the node is listening. If the url is null, the peer will
-// attempt to guess the url according the following rules:
-//
-//        - If the inf & 0x10000 == 0x10000, the protocol is wss, otherwise the protocol is ws.
-//
-//        - The node must know which port it is listening on, the port number is in the low 16 bits
-//          of the inf field.
-//
-//        - Use the ip address of the node as the host name to construct the url.
-//
-//      For example, the url could be the following form:
-//
-//          <ws|wss>://<ipaddr>:<TinioHandshakePack.inf & 0xffff>
-//
-// After the peer has processed the url, it will check if the url is already in its connection pool.
-// the peer will decline the connection by sending a handshake package:
-//
-//          TinioHandshakePack {
-//              type: "tinio-ack",
-//              inf:  1
-//          }
-//
-// If the url is not in use, the peer will accept the connection and keep it in a connection pool.
-// The peer will also send a handshake package back to the node:
-//
-//          TinioHandshakePack {
-//              type: "tinio-ack",
-//              url: "the node's url",
-//              inf: 0,
-//              data: "any data from upper layer"
-//          }
-//
-// In the ack package, the url is the url on which the peer has marked the node in its connection pool.
-// If the node don't know its own url, it can use the url in the ack package.
-// Basically, if all nodes are running in the same network, the url guessed by any peer should be correct.
-// Based on this assumption, the Tinio could be running in the following scenarios:
-//
-//      - All nodes are running in the same network, the url guessed by any peer should be correct.
-//
-//      - If a node won't be connected by any other nodes, that means the node is playing the role of
-//        a client, in this case, the node can be running in any network which can reache the peer.
-//
-
-
-type TinioHandshakePack = {
-    type: "tinio-req" | "tinio-ack",
-    url?: string,
-    inf: number,
-    data?: any
+export type TinioListenParams = {
+    port?: number
+    address?: string
+    path?: string
+    ssl? :{
+        cert: string,
+        key: string
+    }
 }
 
-export type OnTinioConnected = (url: string) => Promise<void>
-export type OnTinioDisconnected = (url: string) => Promise<void>
-export type OnTinioReceived = (url: string, data: any) => Promise<any>
-export type OnTinioAuthrequest = (url: string) => Promise<any>
-export type OnTinioAuthcheck = (url: string, data: any) => Promise<boolean>
+export type TinioDelegate = {
+    onAquireSession: (peer:string)=>Promise<any>
+    onValidateSession: (peer:string, data:any)=>Promise<boolean>
+    onSessionEstablished: (session: TinioSession)=>Promise<void>
+    onSessionTerminated: (session: TinioSession)=>void
+    onMessage: (session: TinioSession, message: Record<string, unknown>)=>Promise<void>
+    onError: (err: TinioError)=>void
+}
 
-export type WebSocketServerOptions = WebSocket.ServerOptions
+const TinioErrorMessages = [
+    'Unknown error',            // Unknown
+    'Reject by peer',           // Reject
+    'Invalid data',             // InvalidData origin = any
+    'Connection Reset',         // Reset origin = WebSocket.CloseEvent
+    'Connection Error',         // Error origin = WebSocket.ErrorEvent
+    'Timeout',                  // Timeout
+    'Canceled',                 // Canceled
+    'Application error'         // AppError
+]
 
-export type TinioConfigure = {
-    url?: string,        // The url could be reached by the other server
-    net:{
-        host?: string,   // The host to listen
-        port?: number,   // The port to listen
-        backlog?: number, // The backlog to listen
-        rejectUnauthorized?: boolean, // Reject unauthorized ssl connections
-        perMessageDeflate?: boolean, // Enable per message deflate
-        ssl?:{
-            cert: string,   // The content to the certificate file
-            key: string     // The content to the key file
+export class TinioError extends Error {
+    reason: number
+    message: string
+    peer: string
+    data?: any
+    session?: TinioSession
+    origin?: Error | WebSocket.CloseEvent | WebSocket.ErrorEvent | any
+
+    constructor(reason: number, peer:string, data?: any, ses?: TinioSession, origin?: Error | WebSocket.CloseEvent | WebSocket.ErrorEvent | any){
+        reason = reason < 0 || reason >= TinioErrorMessages.length ? 0 : reason
+        super(`TinioError: ${TinioErrorMessages[reason]}`)
+        this.name = 'TinioError'
+        this.reason = reason
+        this.message = TinioErrorMessages[reason]
+        this.peer = peer
+        this.data = data
+        this.session = ses
+        this.origin = origin
+    }
+
+    static readonly Unknown         = 0
+    static readonly Reject          = 1
+    static readonly InvalidData     = 2
+    static readonly Reset           = 3
+    static readonly Error           = 4
+    static readonly Timeout         = 5
+    static readonly Canceled        = 6
+    static readonly AppError        = 7
+}
+
+export class TinioSession {
+
+    /** @internal */ private _uuid : string
+    /** @internal */ private _peer : string
+    /** @internal */ private _sock : WebSocket.WebSocket | null
+    /** @internal */ private _tinio : Tinio
+    /** @internal */ private _data : any
+    /** @internal */ private _delegate : TinioDelegate
+    /** @internal */ private _direction : number
+
+    /** @internal */ private constructor(peer: string, dir:number, sock: WebSocket.WebSocket, tinio: Tinio, delegate: TinioDelegate){
+        this._uuid = randomUUID()
+        this._peer = peer
+        this._direction = dir
+        this._sock = sock
+        this._tinio = tinio
+        this._delegate = delegate
+        this._sock.onmessage = this._onMessage.bind(this)
+        this._sock.onclose = this._onClose.bind(this)
+        this._sock.onerror = this._onError.bind(this)
+    }
+
+    /** @internal */ static [kCreateSession](peer:string, dir:number, sock:WebSocket.WebSocket, tinio:Tinio, delegate: TinioDelegate): TinioSession {
+        return new TinioSession(peer, dir, sock, tinio, delegate)
+    }
+
+    /** @internal */ private async _onMessage(event: WebSocket.MessageEvent) {
+        try{
+            const msg = JSON.parse(event.data.toString())
+            try{
+                await this._delegate.onMessage(this, msg)
+            }catch(e){
+                this._delegate.onError(new TinioError(TinioError.AppError, this._peer, msg, this, e))
+            }
+        }catch(e){
+            this._delegate.onError(new TinioError(TinioError.InvalidData, this._peer, event.data, this, e))
         }
     }
-    onConnected?: OnTinioConnected,
-    onDisconnected?: OnTinioDisconnected,
-    onReceived?: OnTinioReceived,
-    onAuthrequest?: OnTinioAuthrequest,
-    onAuthcheck?: OnTinioAuthcheck
-}
 
-export type TinioProperties = {
-    online: boolean,
-    url?: string,
-    net:{
-        address: string,
-        port: number,
-        family: string,
-        secure: boolean
+    /** @internal */ private async _onClose(/* event: WebSocket.CloseEvent */) {
+        return this.terminate()
     }
+
+    /** @internal */ private async _onError(event: WebSocket.ErrorEvent) {
+        this._delegate.onError(new TinioError(TinioError.Error, this._peer, undefined, this, event))
+        return this.terminate()
+    }
+
+    /**
+     * Send a message through the session
+     * 
+     * @param message - Message to send
+     */
+    async send(message: Record<string, unknown>): Promise<void> {
+        try{
+            const msg = JSON.stringify(message)
+            if(this._sock == null || this._sock.readyState !== WebSocket.WebSocket.OPEN){
+                throw new TinioError(TinioError.Reset, this._peer, message, this)
+            }
+            await this._sock.send(msg)
+        }catch(e){
+            if(e instanceof TinioError){
+                throw e
+            }else{
+                throw new TinioError(TinioError.InvalidData, this._peer, message, this, e)
+            }
+        }
+    }
+
+    /**
+     * Terminate the session
+     */
+    terminate() {
+        if(this._sock != null){
+            this._sock.removeAllListeners()
+            this._sock.close()
+            this._sock = null
+            this._delegate.onSessionTerminated(this)
+            this._tinio[kRemoveSession](this)
+        }
+    }
+
+    /**
+     * The unique ID for this session
+     */
+    get uuid(): string { return this._uuid }
+
+    /**
+     * The peer URL
+     */
+    get peer(): string { return this._peer }
+
+    /**
+     * User data
+     */
+    get data(): any { return this._data }
+
+    /**
+     * User data
+     */
+    set data(d:any) { this._data = d }
+
+    /**
+     * Determine if the session is alive
+     */
+    get alive(): boolean { return (this._sock != null && this._sock.readyState === WebSocket.WebSocket.OPEN) }
+
+    /**
+     * Determine if the session is Outgoing
+     */
+    get direction(): number { return this._direction }
+
+    static readonly Incoming = 0
+    static readonly Outgoing = 1
+
 }
 
 export class Tinio {
-    /** @internal */ private _wss: WebSocket.WebSocketServer | undefined
-    /** @internal */ private _cfg: TinioConfigure
-    /** @internal */ private _connections: Map<string, WebSocket.WebSocket> = new Map()
-    /** @internal */ private _onTinioConnected: OnTinioConnected | undefined
-    /** @internal */ private _onTinioDisconnected: OnTinioDisconnected | undefined
-    /** @internal */ private _onTinioReceived: OnTinioReceived | undefined
-    /** @internal */ private _onTinioAuthrequest: OnTinioAuthrequest | undefined
-    /** @internal */ private _onTinioAuthcheck: OnTinioAuthcheck | undefined
 
-    constructor(cfg: TinioConfigure) {
-        this._cfg = cfg
-        this._onTinioConnected = cfg.onConnected
-        this._onTinioDisconnected = cfg.onDisconnected
-        this._onTinioReceived = cfg.onReceived
-        this._onTinioAuthcheck = cfg.onAuthcheck
-        this._onTinioAuthrequest = cfg.onAuthrequest
+    /** @internal */ private _connect_timeout = 10000
+    /** @internal */ private _connections : Map<string, TinioSession> = new Map()
+    /** @internal */ private _delegate : TinioDelegate = {
+        /* eslint-disable @typescript-eslint/no-empty-function */
+        onAquireSession: async (_peer:string)=>{},
+        onValidateSession: async (_peer:string, _data:any)=>{ return true },
+        onSessionEstablished: async (_session: TinioSession)=>{},
+        onSessionTerminated: async (_session: TinioSession)=>{},
+        onMessage: async (_session: TinioSession, _message: Record<string, unknown>)=>{},
+        onError: (_err: TinioError)=>{}
+        /* eslint-enable @typescript-eslint/no-empty-function */
     }
 
-    start(): boolean {
-        const options:any = {
-            host: this._cfg.net.host,
-            port: this._cfg.net.port || 0,
-            backlog: this._cfg.net.backlog || 100,
-            rejectUnauthorized: this._cfg.net.rejectUnauthorized || false,
-            perMessageDeflate: this._cfg.net.perMessageDeflate || false
-        };
-        if(this._cfg.net.ssl){
-            options.key = this._cfg.net.ssl.key;
-            options.cert = this._cfg.net.ssl.cert;
-            const srv = https.createServer(options);
-            this._wss = new WebSocket.WebSocketServer({server: srv});
-            srv.listen(options.port, options.host);
+    /** @internal */ private _listen_params : TinioListenParams = { port: 0 }
+    /** @internal */ private _ws : WebSocket.Server | null = null
+
+    constructor(){
+        
+    }
+
+    /**
+     * Start to accept session requests
+     * 
+     * @returns {boolean} true if the server started successfully
+     */
+    startListen(params? : TinioListenParams): boolean {
+        apply_from(this._listen_params, params)
+        if(this._listen_params.port == null) this._listen_params.port = 0
+
+        if(this._listen_params.ssl){
+            const server = https.createServer(this._listen_params.ssl)
+            this._ws = new WebSocket.Server({ server })
+            server.listen(this._listen_params.port, this._listen_params.address)
         }else{
-            this._wss = new WebSocket.WebSocketServer(options);
+            this._ws = new WebSocket.WebSocketServer({
+                host: this._listen_params.address,
+                port: this._listen_params.port,
+                path: this._listen_params.path
+            })
         }
-        this._wss.on('connection', (ws: WebSocket.WebSocket) => {
-            const _tinio = this;
-            ws.onmessage = async (event: WebSocket.MessageEvent) => {
-                try{
-                    const data = JSON.parse(event.data.toString()) as TinioHandshakePack;
-                    if(data.type === "tinio-req"){
-                        if(data.url == null){
-                            // Guess the url
-                            const inf = data.inf
-                            const port = inf & 0xffff
-                            const host = (ws as any)._socket.remoteAddress;
-                            const protocol = (inf & 0x10000)?'wss':'ws'
-                            data.url = `${protocol}://${host}:${port}`
-                        }
-                        // Check if the url is already in use
-                        if(this._connections.has(data.url) || (this._onTinioAuthcheck && (await this._onTinioAuthcheck(data.url, data.data)) == false)){
-                            // Send the error pack back and close the connection
-                            await _tinio._send(ws, {
-                                type: "tinio-ack",
-                                inf: 1
-                            })
-                            throw 1;
-                        } else {
-                            await _tinio._send(ws, {
-                                type: "tinio-ack",
-                                url: data.url,
-                                inf: 0,
-                                data: (this._onTinioAuthrequest)?(await this._onTinioAuthrequest(data.url)):null
-                            })
-                            await _tinio._createConnection(data.url, ws)
-                        }
-                    }
-                }catch(e){ ws.onmessage = null; ws.close(); }
+
+        this._ws.on('connection', async (sock: WebSocket.WebSocket)=>{
+            const remote_addr = (sock as any)?._socket?.remoteAddress
+            if(!remote_addr){
+                sock.close()
+                return
+            }
+            try{
+                const event: WebSocket.MessageEvent = await new Promise((resolve, reject)=>{
+                    const tid = setTimeout(()=>reject(new TinioError(TinioError.Timeout, remote_addr)), this._connect_timeout)
+                    sock.onmessage = (event: WebSocket.MessageEvent)=>(clearTimeout(tid), resolve(event))
+                    sock.onerror = (event: WebSocket.ErrorEvent)=>(clearTimeout(tid), reject(new TinioError(TinioError.Error, remote_addr, undefined, undefined, event)))
+                    sock.onclose = (event: WebSocket.CloseEvent)=>(clearTimeout(tid), reject(new TinioError(TinioError.Reset, remote_addr, undefined, undefined, event)))
+                })
+
+                const msg = JSON.parse(event.data.toString()) as SessionRequest
+                if(msg.cmd !== 'session-request'){
+                    throw new TinioError(TinioError.InvalidData, remote_addr, msg)
+                }
+
+                if(await this._delegate.onValidateSession(remote_addr, msg.data) === false){
+                    throw new TinioError(TinioError.Canceled, remote_addr, msg)
+                }
+
+                const ack: SessionAck = {
+                    cmd: 'session-ack',
+                    data: await this._delegate.onAquireSession(remote_addr)
+                }
+                sock.send(JSON.stringify(ack))
+                const ses = TinioSession[kCreateSession](remote_addr, TinioSession.Incoming, sock, this, this._delegate)
+                this._connections.set(ses.uuid, ses)
+                await this._delegate.onSessionEstablished(ses)
+
+            }catch(e){
+                sock.close()
+                if(e instanceof TinioError){
+                    this._delegate.onError(e)
+                }else{
+                    this._delegate.onError(new TinioError(TinioError.Error, remote_addr, undefined, undefined, e))
+                }
             }
         })
+
         return true
     }
 
-    /** @internal */ private async _closeConnection(url: string, ws: WebSocket.WebSocket, removeFromSet: boolean = true){
-        ws.onerror = null
-        ws.onclose = null
-        ws.close()
-        if(removeFromSet) this._connections.delete(url)
-        if(this._onTinioDisconnected) return this._onTinioDisconnected(url)
-    }
-
-    /** @internal */ private async _send(ws: WebSocket.WebSocket, data: any){
-        try{
-            ws.send(JSON.stringify(data))
-        }catch(e){ }
-    }
-
-    /** @internal */ private async _receiveMessage(url: string, ws: WebSocket.WebSocket, data: string){
-        if(this._onTinioReceived){
-            let _data = null
-            try{ _data = JSON.parse(data)}catch(e){}
-            const rep = await this._onTinioReceived(url, _data)
-            if(rep) this._send(ws, rep)
+    /**
+     * Stop to accept session requests
+     */
+    stopListen() {
+        if(this._ws){
+            this._ws.close()
+            this._ws = null
         }
     }
 
-    /** @internal */ private async _createConnection(url: string, ws: WebSocket.WebSocket){
-        ws.onerror = async (event: WebSocket.ErrorEvent) => { return this._closeConnection(url, ws) }
-        ws.onclose = async (event: WebSocket.CloseEvent) => { return this._closeConnection(url, ws) }
-        ws.onmessage = async (event: WebSocket.MessageEvent) => {if(this._onTinioReceived) return this._receiveMessage(url, ws, event.data.toString()) }
-        this._connections.set(url, ws)
-        if(this._onTinioConnected) await this._onTinioConnected(url)
+    /**
+     * Shutdown Tinio
+     * This will stop listen and terminate all sessions
+     */
+    async halt() {
+        this.stopListen()
+        const snapshot = Array.from(this._connections.values())
+        for(const session of snapshot){
+            await session.terminate()
+        }
+    }
+
+    /** @internal */ [kRemoveSession](session: TinioSession) {
+        this._connections.delete(session.uuid)
     }
 
     /**
-     * Fetch a connection from the url
+     * Aquire a session with a peer
      * 
-     * - If the connection is already established, return the connection
-     * - If the connection is not established, try to establish the connection
+     * @param peer - The URL to the peer
+     * @returns 
      */
-    /** @internal */ private async _getConnectionFromUrl(url: string): Promise<WebSocket.WebSocket|null>{
-        // Fetch the connection from the pool.
-        const ews = this._connections.get(url)
-        if(ews) return ews
-
-        // Attempt to establish a new connection
-        return new Promise((resolve, reject) => {
-            const ws = new WebSocket.WebSocket(url)
-            ws.onopen = async (event: WebSocket.Event) => {
-                const req:TinioHandshakePack = {
-                    type: "tinio-req",
-                    url: this._cfg.url,
-                    inf: 0,
-                    data: this._onTinioAuthrequest?(await this._onTinioAuthrequest(url)):null
-                }
-                const addr = this._wss?.address() as WebSocket.AddressInfo;
-                if(addr) req.inf = addr.port;
-                if(this._cfg.net.ssl) req.inf = req.inf & 0x10000;
-                ws.send(JSON.stringify(req))
-                ws.onmessage = async (event: WebSocket.MessageEvent) => {
-                    try{
-                        const data = JSON.parse(event.data.toString()) as TinioHandshakePack;
-                        if(data.type !== "tinio-ack" || data.inf !== 0) throw 1;
-                        if(!this._cfg.url) this._cfg.url = data.url;
-                        if(this._onTinioAuthcheck && ((await this._onTinioAuthcheck(url, data.data)) == false)) throw 1;
-                        this._createConnection(url, ws)
-                        resolve(ws)
-                    }catch(e){
-                        ws.onerror = null;
-                        ws.onclose = null;
-                        ws.onmessage = null;
-                        ws.onopen = null;
-                        ws.close();
-                        return resolve(null);
+    async aquireSession(peer:string): Promise<TinioSession> {
+        return new Promise((resolve, reject)=>{
+            const sock = new WebSocket.WebSocket(peer)
+            sock.onopen = async ()=>{
+                try{
+                    const req : SessionRequest = {
+                        cmd: 'session-request',
+                        data: await this._delegate.onAquireSession(peer)
                     }
+                    sock.send(JSON.stringify(req));
+                    (sock as any).tid = setTimeout(()=>{
+                        sock.removeAllListeners()
+                        sock.close()
+                        reject(new TinioError(TinioError.Timeout, peer))
+                    }, this._connect_timeout)
+                }catch(e){
+                    sock.removeAllListeners()
+                    sock.close()
+                    reject(new TinioError(TinioError.Unknown, peer, undefined, undefined, e))
                 }
-                
             }
-            ws.onerror = async (event: WebSocket.ErrorEvent) => { return resolve(null); }
-            ws.onclose = async (event: WebSocket.CloseEvent) => { return resolve(null); }
-        });
+            const close_reject = (reason: any)=>{
+                clearTimeout((sock as any).tid)
+                sock.removeAllListeners()
+                sock.close()
+                reject(reason)
+            }
+            sock.onmessage = async (event: WebSocket.MessageEvent)=>{
+                try{
+                    const ack = JSON.parse(event.data.toString()) as SessionAck
+                    if(ack.cmd === 'session-ack'){
+                        if(await this._delegate.onValidateSession(peer, ack.data) == false){
+                            close_reject(new TinioError(TinioError.Canceled, peer))
+                        }
+                        clearTimeout((sock as any).tid)
+                        const ses = TinioSession[kCreateSession](peer, TinioSession.Outgoing, sock, this, this._delegate)
+                        this._connections.set(ses.uuid, ses)
+                        await this._delegate.onSessionEstablished(ses)
+                        resolve(ses)
+                    } else if(ack.cmd === 'session-reject'){
+                        close_reject(new TinioError(TinioError.Reject, peer, ack.data))
+                    } else {
+                        close_reject(new TinioError(TinioError.InvalidData, peer, event.data))
+                    }
+                }catch(e){
+                    close_reject(new TinioError(TinioError.InvalidData, peer, event.data, undefined, e))
+                }
+            }
+            sock.onerror = (event: WebSocket.ErrorEvent)=>{
+                close_reject(new TinioError(TinioError.Error, peer, undefined, undefined, event))
+            }
+            sock.onclose = (event: WebSocket.CloseEvent)=>{
+                close_reject(new TinioError(TinioError.Reset, peer, undefined, undefined, event))
+            }
+        })
     }
 
-    stop(): void {
-        for (const [url, ws] of this._connections)
-            this._closeConnection(url, ws, true)
-        this._connections.clear()
-        if(this._wss){
-            this._wss.close()
-            this._wss = undefined
-        }
-    }
+    get delegate(): TinioDelegate { return this._delegate }
 
     /**
-     * Send a message to the given url
-     * @param url the destination url
-     * @param data anything what could be serialized in JSON
-     * @returns true if the data was sent successfully, false otherwise
+     * Determine if the Tinio is listening
      */
-    async send(url: string, data: any): Promise<boolean> {
-        // Fetch the connection
-        const ws = await this._getConnectionFromUrl(url)
-        if(ws){
-            this._send(ws, data)
-            return true
-        }
-        return false
-    }
+    get listening(): boolean { return false }
 
-    get connections(): string[] {
-        return Array.from(this._connections.keys())
-    }
-
-    get properties(): TinioProperties {
-        const ret = {
-            online: false,
-            url: this._cfg.url,
-            net:{
-                address: '',
-                port: 0,
-                family: '',
-                secure: this._cfg.net.ssl?true:false
-            }
-        } as TinioProperties;
-
-        if(this._wss){
-            const addrInfo = this._wss.address() as WebSocket.AddressInfo
-            if(addrInfo){
-                ret.net.address = addrInfo.address + os.hostname
-                ret.net.family = addrInfo.family
-                ret.net.port = addrInfo.port
-                ret.online = true
-            }
-        }
-
-        return ret;
-    }
+    /**
+     * Retrieve all alive sessions
+     */
+    get sessions(): TinioSession[] { return Array.from(this._connections.values()) }
 
 }
+

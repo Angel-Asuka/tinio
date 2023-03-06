@@ -5,4 +5,5 @@ config/
 tsconfig.*
 .gitlab-ci.yml
 .gitignore
+.eslintrc.yml
 node_modules

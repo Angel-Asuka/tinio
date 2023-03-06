@@ -1,103 +1,55 @@
-// Description: Test the tinio module
+import fs from 'node:fs'
+import process from 'node:process'
+import url from "node:url"
+import path from "node:path"
 
-import process from "process"
-import { Tinio, TinioConfigure } from "../src/tinio.js"
+type TestFunc = ()=>Promise<boolean>
+type ModuleExport = {testers:{[key:string]:TestFunc}}
 
-console.log("Begin tinio testing >>>>>>>>>>>")
-
-let tinio1_check = false
-let tinio2_check = false
-
-let peer_url = ''
-
-const tinio1 = new Tinio({
-    net: {
-        port: 8080
-    },
-    onReceived: (url: string, data: any) => {
-        console.log("tinio1 received message from tinio2")
-        console.log("----- tinio1 received data: ", data)
-        if(data.msg === "Hello") tinio1_check = true
-    },
-    onAuthrequest: async (url: string) => {
-        return "HelloKey"
+async function main(){
+    const root_path = path.dirname(url.fileURLToPath(import.meta.url))
+    const testers:Array<{name:string, func:TestFunc}> = []
+    const units = fs.readdirSync(root_path + "/units")
+    const modfiles:Array<string> = []
+    units.forEach(async (u: string)=>{
+        if (u.substring(u.length - 3).toLowerCase() == '.js'){
+            const path = `${root_path}/units/${u}`
+            modfiles.push(path)
+        }
+    })
+    for(let f of modfiles){
+        const t:ModuleExport = (await import(f)) as ModuleExport
+        if(t && t.testers){
+            for(let test in t.testers){
+                testers.push({name:test, func:t.testers[test]})
+            }
+        }
     }
-} as TinioConfigure)
 
-const tinio2 = new Tinio({
-    url: "ws://localhost:8081",
-    net: {
-        port: 8081
-    },
-    onReceived: (url: string, data: any) => {
-        console.log("tinio2 received message from tinio1")
-        console.log("----- tinio2 received data: ", data)
-        if(data.msg === "Hello") tinio2_check = true
-        return data
-    },
-    onConnected: (url: string) => {
-        console.log(`Peer connected ${url}`)
-        peer_url = url
-    },
-    onAuthcheck: async (url: string, data: any) => {
-        console.log(`Auth check from node: ${url} : ${data}`)
-        return true;
+    let faultCount = 0
+    for(let i = 0; i < testers.length; ++i){
+        const test = testers[i]
+        console.log(`Test [${i+1}/${testers.length}] ${test.name} started.`)
+        const v = test.func
+        let ret = false
+        try{
+            ret = await v()
+            console.log(`Test [${i+1}/${testers.length}] ${test.name} passed.`)
+        }catch(e){
+            console.log(`Test [${i+1}/${testers.length}] ${test.name} failed: `, e)
+            faultCount++
+        } 
     }
-} as TinioConfigure)
 
-console.log("Starting tinio1")
-tinio1.start()
-
-console.log("Starting tinio2")
-tinio2.start()
-
-console.log(tinio1.properties)
-
-console.log("Sending 'Hello' from tinio1 to tinio2")
-await tinio1.send("ws://localhost:8081", {msg: "Hello"})
-
-console.log(tinio1.properties)
-
-console.log("Waiting for tinio1 to receive 'Hello' from tinio2")
-let check_times = 0
-
-while(!tinio1_check){
-    check_times++
-    if(check_times > 10){
-        console.log("tinio1 did not receive 'Hello' from tinio2")
-        console.log("FAILED")
+    console.log(`Test Job Finished.`)
+    console.log(`Total: ${testers.length}, ${testers.length - faultCount} Passed,  ${faultCount} Failed`)
+    if(faultCount){
+        console.log(`Test Job Failed.`)
         process.exit(1)
+    }else{
+        console.log(`Test Job Passed.`)
+        process.exit(0)
     }
-    await new Promise(resolve => setTimeout(resolve, 1000))
 }
 
-console.log("tinio1 received 'Hello' from tinio2")
-
-tinio1_check = false
-console.log("Sending 'Hello' from tinio2 to tinio1")
-await tinio2.send(peer_url, {msg: "Hello"})
-
-check_times = 0
-
-while(!tinio1_check){
-    check_times++
-    if(check_times > 10){
-        console.log("tinio1 did not receive 'Hello' from tinio2")
-        console.log("FAILED")
-        process.exit(1)
-    }
-    await new Promise(resolve => setTimeout(resolve, 1000))
-}
-
-
-console.log("tinio1 received 'Hello' from tinio2")
-
-console.log("stopping tinio1")
-tinio1.stop()
-
-console.log("stopping tinio2")
-tinio2.stop()
-
-console.log("PASSED")
-
-console.log("<<<<<<<<<<<<< End tinio testing")
+await main();
