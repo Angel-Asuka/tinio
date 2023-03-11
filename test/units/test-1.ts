@@ -8,6 +8,7 @@ export const testers = {
         let cp_on_aquire_session = false
         let cp_on_session_established = false
         let cp_on_message = false
+        let cp_request_ok = false
         let cp_message_ok = false
         let cp_on_session_terminated = false
 
@@ -30,14 +31,17 @@ export const testers = {
             console.log('onSessionEstablished Triggered')
             cp_on_session_established = true
         }
-        server.delegate.onMessage = async (ses: TinioSession, data: Record<string, unknown>) => {
+        server.delegate.onMessage = async (ses: TinioSession, msg: string, data?: Record<string, unknown>) => {
             console.log('onMessage Triggered')
             cp_on_message = true
-            if(data.val == 30){
+            if(msg == 'msg'){
                 console.log('onMessage data ok')
                 cp_message_ok = true
+            }else if(msg == 'req'){
+                console.log('onRequest data ok')
+                cp_request_ok = true
+                return {val:40}
             }
-            ses.send({val:40})
         }
         server.delegate.onSessionTerminated = (ses: TinioSession) => {
             console.log('onSessionTerminated Triggered')
@@ -54,33 +58,23 @@ export const testers = {
             console.log('client-side onValidateSession data not ok', data)
             return false
         }
-        client.delegate.onSessionEstablished = async (ses: TinioSession) => {
-            ses.send({val:30})
-        }
-        client.delegate.onMessage = async (ses: TinioSession, data: Record<string, unknown>) => {
-            ses.terminate()
-        }
 
         server.startListen({
             port: 18080,
         })
 
         const clises = await client.aquireSession("ws://127.0.0.1:18080")
-        clises.send({val:30})
 
-        await new Promise((resolve, reject) => {
-            let wait_times = 0
-            const i = setInterval(() => {
-                if(cp_on_session_terminated)
-                    resolve(0)
-                if(++wait_times > 100) {
-                    clearInterval(i)
-                    reject('TimeOut')
-                }
-            }, 100)
-        })
+        await clises.send('msg', {val:30})
+        const rep = await clises.request('req', {val:30})
+
+        if(rep.val != 40) throw new Error('request data not ok')
+
+        clises.terminate()
 
         server.stopListen()
+
+        server.halt()
 
         if(!cp_on_validate_session) throw new Error('onValidateSession not triggered')
         if(!cp_validate_session_data_ok) throw new Error('onValidateSession data not ok')

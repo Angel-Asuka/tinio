@@ -1,7 +1,7 @@
 import * as WebSocket from 'ws'
 import https from 'https'
 import { randomUUID } from 'crypto'
-import { SessionRequest, SessionAck } from './protocol.js'
+import { SessionRequest, SessionAck, Msg, Req, Ack } from './protocol.js'
 import { apply_from } from '@acsl/toolbox'
 
 const kCreateSession = Symbol()
@@ -22,7 +22,7 @@ export type TinioDelegate = {
     onValidateSession: (peer:string, data:any)=>Promise<boolean>
     onSessionEstablished: (session: TinioSession)=>Promise<void>
     onSessionTerminated: (session: TinioSession)=>void
-    onMessage: (session: TinioSession, message: Record<string, unknown>)=>Promise<void>
+    onMessage: (session: TinioSession, message: string, data?: Record<string, unknown>)=>Promise<Record<string, unknown>|void>
     onError: (err: TinioError)=>void
 }
 
@@ -76,6 +76,7 @@ export class TinioSession {
     /** @internal */ private _data : any
     /** @internal */ private _delegate : TinioDelegate
     /** @internal */ private _direction : number
+    /** @internal */ private _reqs : Map<string, (data: any)=>void> = new Map()
 
     /** @internal */ private constructor(peer: string, dir:number, sock: WebSocket.WebSocket, tinio: Tinio, delegate: TinioDelegate){
         this._uuid = randomUUID()
@@ -97,7 +98,35 @@ export class TinioSession {
         try{
             const msg = JSON.parse(event.data.toString())
             try{
-                await this._delegate.onMessage(this, msg)
+                if(msg.cmd === 'msg'){
+                    const req = msg as Msg
+                    const res = await this._delegate.onMessage(this, req.msg, req.data)
+                    if(res != null){
+                        await this._send({
+                            cmd: 'msg',
+                            msg: req.msg,
+                            data: res
+                        })
+                    }
+                }else if(msg.cmd === 'req'){
+                    const req = msg as Req
+                    const res = await this._delegate.onMessage(this, req.msg, req.data)
+                    await this._send({
+                        cmd: 'ack',
+                        rid: req.rid,
+                        data: res
+                    })
+                }else if(msg.cmd === 'ack'){
+                    const ack = msg as Ack
+                    const cb = this._reqs.get(ack.rid)
+                    if(cb != null){
+                        // Call cb directly, the record will be removed by the callback
+                        cb(ack.data)
+                    }
+                }else{
+                    // Otherwise, ignore the message
+                    this._delegate.onError(new TinioError(TinioError.InvalidData, this._peer, msg, this))
+                }
             }catch(e){
                 this._delegate.onError(new TinioError(TinioError.AppError, this._peer, msg, this, e))
             }
@@ -116,24 +145,74 @@ export class TinioSession {
     }
 
     /**
-     * Send a message through the session
-     * 
-     * @param message - Message to send
+     * Send a package through the session
      */
-    async send(message: Record<string, unknown>): Promise<void> {
+    /** @internal */ private async _send(pkg: Record<string, unknown>): Promise<void> {
         try{
-            const msg = JSON.stringify(message)
+            const msg = JSON.stringify(pkg)
             if(this._sock == null || this._sock.readyState !== WebSocket.WebSocket.OPEN){
-                throw new TinioError(TinioError.Reset, this._peer, message, this)
+                throw new TinioError(TinioError.Reset, this._peer, pkg, this)
             }
             await this._sock.send(msg)
         }catch(e){
             if(e instanceof TinioError){
                 throw e
             }else{
-                throw new TinioError(TinioError.InvalidData, this._peer, message, this, e)
+                throw new TinioError(TinioError.InvalidData, this._peer, pkg, this, e)
             }
         }
+    }
+
+    /**
+     * Send a message to the peer
+     * 
+     * @param msg - Message name
+     * @param data - Message data
+     * @remarks
+     * Send a message to the peer. The promise will be fulfilled when the peer
+     * receives the message. If the peer sends a response, another onMessage event
+     * will be triggered.
+     */
+    async send(msg: string, data?: any): Promise<void> {
+        await this._send({
+            cmd: 'msg',
+            msg: msg,
+            data: data
+        })
+    }
+
+    /**
+     * Send a request to the peer
+     * 
+     * @param msg - Message name
+     * @param data - Message data
+     * @returns - Response data
+     * @remarks
+     * Send a request to the peer. The promise will be fulfilled when the peer
+     * responds to the request. If the peer does not respond within the timeout
+     * period, the promise will be rejected.
+     */
+    async request(msg: string, data?: any): Promise<any> {
+        const rid = randomUUID()
+        const p = new Promise((resolve, reject) => {
+            const tid = setTimeout(() => {
+                this._reqs.delete(rid)
+                reject(new TinioError(TinioError.Timeout, this._peer, data, this))
+            }, this._tinio.requestTimeout)
+            const solve = (data: any) => {
+                clearTimeout(tid)
+                this._reqs.delete(rid)
+                resolve(data)
+            }
+            this._reqs.set(rid, solve)
+        })
+        await this._send({
+            cmd: 'req',
+            rid: rid,
+            msg: msg,
+            data: data
+        })
+        return p
     }
 
     /**
@@ -187,6 +266,7 @@ export class TinioSession {
 export class Tinio {
 
     /** @internal */ private _connect_timeout = 10000
+    /** @internal */ private _request_timeout = 10000
     /** @internal */ private _connections : Map<string, TinioSession> = new Map()
     /** @internal */ private _delegate : TinioDelegate = {
         /* eslint-disable @typescript-eslint/no-empty-function */
@@ -194,7 +274,7 @@ export class Tinio {
         onValidateSession: async (_peer:string, _data:any)=>{ return true },
         onSessionEstablished: async (_session: TinioSession)=>{},
         onSessionTerminated: async (_session: TinioSession)=>{},
-        onMessage: async (_session: TinioSession, _message: Record<string, unknown>)=>{},
+        onMessage: async (_session: TinioSession, _message: string, _data?: Record<string, unknown>)=>{},
         onError: (_err: TinioError)=>{}
         /* eslint-enable @typescript-eslint/no-empty-function */
     }
@@ -373,5 +453,29 @@ export class Tinio {
      */
     get sessions(): TinioSession[] { return Array.from(this._connections.values()) }
 
+    /**
+     * Retrieve the number of alive sessions
+     */
+    get sessionCount(): number { return this._connections.size }
+
+    /**
+     * Retrieve the connect timeout
+     */
+    get connectTimeout(): number { return this._connect_timeout }
+
+    /**
+     * Set the connect timeout
+     */
+    set connectTimeout(timeout: number) { this._connect_timeout = timeout }
+
+    /**
+     * Retrieve the request timeout
+     */
+    get requestTimeout(): number { return this._request_timeout }
+
+    /**
+     * Set the request timeout
+     */
+    set requestTimeout(timeout: number) { this._request_timeout = timeout }
 }
 
