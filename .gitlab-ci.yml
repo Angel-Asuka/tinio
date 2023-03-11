@@ -22,6 +22,7 @@ release:
     untracked: false
     when: on_success
   script:
+    - if [ ! -z "$AVOID_RELEASE" ]; then echo "AVOID_RELEASE is set, skipping release"; exit 0; fi
     - autoenv
     - npm install
     - npm run build
