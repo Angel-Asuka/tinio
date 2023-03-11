@@ -27,7 +27,7 @@ release:
     - npm run build
     - npm pack
     - npm-try-publish
-    - npm-try-publish https://repos.afx.pub/repository/npm-host/
+    - npm-try-publish https://nexus.afx.pub/repository/npm-host/
     - VERSION=$(node -p "require('./package.json').version")
     - TAGNAME=$CI_PROJECT_NAME-$VERSION
     - tag-req $TAGNAME "main" "Automatic tag request for version ${VERSION} by CI/CD Bot."
