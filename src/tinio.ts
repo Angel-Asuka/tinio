@@ -18,8 +18,8 @@ export type TinioListenParams = {
 }
 
 export type TinioDelegate = {
-    onAquireSession: (peer:string)=>Promise<any>
-    onValidateSession: (peer:string, data:any)=>Promise<boolean>
+    onAquireSession: (peer:string, info:any)=>Promise<any>
+    onValidateSession: (peer:string, data:any, info:any)=>Promise<boolean>
     onSessionEstablished: (session: TinioSession)=>Promise<void>
     onSessionTerminated: (session: TinioSession)=>void
     onMessage: (session: TinioSession, message: string, data?: Record<string, unknown>)=>Promise<Record<string, unknown>|void>
@@ -326,13 +326,13 @@ export class Tinio {
                     throw new TinioError(TinioError.InvalidData, remote_addr, msg)
                 }
 
-                if(await this._delegate.onValidateSession(remote_addr, msg.data) === false){
+                if(await this._delegate.onValidateSession(remote_addr, msg.data, undefined) === false){
                     throw new TinioError(TinioError.Canceled, remote_addr, msg)
                 }
 
                 const ack: SessionAck = {
                     cmd: 'session-ack',
-                    data: await this._delegate.onAquireSession(remote_addr)
+                    data: await this._delegate.onAquireSession(remote_addr, undefined)
                 }
                 sock.send(JSON.stringify(ack))
                 const ses = TinioSession[kCreateSession](remote_addr, TinioSession.Incoming, sock, this, this._delegate)
@@ -382,16 +382,19 @@ export class Tinio {
      * Aquire a session with a peer
      * 
      * @param peer - The URL to the peer
+     * @param info - User data to be transmitted to the onAquireSession and onValidateSession, 
+     *               this parameter is optional and will not be transmitted to the peer.
+     *               Application can use this parameter to pass user data to the delegate methods.
      * @returns 
      */
-    async aquireSession(peer:string): Promise<TinioSession> {
+    async aquireSession(peer:string, info?: any): Promise<TinioSession> {
         return new Promise((resolve, reject)=>{
             const sock = new WebSocket.WebSocket(peer)
             sock.onopen = async ()=>{
                 try{
                     const req : SessionRequest = {
                         cmd: 'session-request',
-                        data: await this._delegate.onAquireSession(peer)
+                        data: await this._delegate.onAquireSession(peer, info)
                     }
                     sock.send(JSON.stringify(req));
                     (sock as any).tid = setTimeout(()=>{
@@ -415,7 +418,7 @@ export class Tinio {
                 try{
                     const ack = JSON.parse(event.data.toString()) as SessionAck
                     if(ack.cmd === 'session-ack'){
-                        if(await this._delegate.onValidateSession(peer, ack.data) == false){
+                        if(await this._delegate.onValidateSession(peer, ack.data, info) == false){
                             close_reject(new TinioError(TinioError.Canceled, peer))
                         }
                         clearTimeout((sock as any).tid)
