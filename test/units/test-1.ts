@@ -13,7 +13,7 @@ export const testers = {
         let cp_on_session_terminated = false
 
         const server = new Tinio()
-        server.delegate.onValidateSession = async (peer: string, data:any) => {
+        server.delegate.onValidateSession = async (r:number, peer: string, data:any) => {
             console.log('onValidateSession Triggered')
             cp_on_validate_session = true
             if(data.val == 10)
@@ -22,7 +22,7 @@ export const testers = {
                 console.log('server-side onValidateSession data not ok', data)
             return "GOOD"
         }
-        server.delegate.onAquireSession = async (peer: string) => {
+        server.delegate.onAcquireSession = async (r:number, peer: string) => {
             console.log('onAquireSession Triggered')
             cp_on_aquire_session = true
             return {val:20}
@@ -50,10 +50,10 @@ export const testers = {
         }
 
         const client = new Tinio
-        client.delegate.onAquireSession = async (peer: string) => {
+        client.delegate.onAcquireSession = async (r:number, peer: string) => {
             return {val:10}
         }
-        client.delegate.onValidateSession = async (peer: string, data:any) => {
+        client.delegate.onValidateSession = async (r:number, peer: string, data:any) => {
             if(data.val == 20)
                 return true
             console.log('client-side onValidateSession data not ok', data)

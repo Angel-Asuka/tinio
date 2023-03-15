@@ -19,8 +19,8 @@ export type TinioListenParams = {
 }
 
 export type TinioDelegate = {
-    onAquireSession: (peer:string, info:any)=>Promise<any>
-    onValidateSession: (peer:string, data:any, info:any)=>Promise<any>
+    onAcquireSession: (reason: number, peer:string, info:any)=>Promise<any>
+    onValidateSession: (reason: number, peer:string, data:any, info:any)=>Promise<any>
     onSessionEstablished: (session: TinioSession)=>Promise<void>
     onSessionTerminated: (session: TinioSession)=>void
     onMessage: (session: TinioSession, message: string, data?: Record<string, unknown>)=>Promise<Record<string, unknown>|void>
@@ -230,8 +230,8 @@ export class Tinio {
     /** @internal */ private _connections : Map<string, TinioSession> = new Map()
     /** @internal */ private _delegate : TinioDelegate = {
         /* eslint-disable @typescript-eslint/no-empty-function */
-        onAquireSession: async (_peer:string)=>{},
-        onValidateSession: async (_peer:string, _data:any)=>{},
+        onAcquireSession: async ()=>{},
+        onValidateSession: async ()=>{},
         onSessionEstablished: async (_session: TinioSession)=>{},
         onSessionTerminated: async (_session: TinioSession)=>{},
         onMessage: async (_session: TinioSession, _message: string, _data?: Record<string, unknown>)=>{},
@@ -286,11 +286,11 @@ export class Tinio {
                     throw new AcslError(AcslError.InvalidData, `Invalid package from ${remote_addr} in handshaking`, {peer:remote_addr, msg:event.data})
                 }
 
-                const app_data = await this._delegate.onValidateSession(remote_addr, msg.data, undefined)
+                const app_data = await this._delegate.onValidateSession(TinioSession.Incoming, remote_addr, msg.data, undefined)
 
                 const ack: SessionAck = {
                     cmd: 'session-ack',
-                    data: await this._delegate.onAquireSession(remote_addr, undefined)
+                    data: await this._delegate.onAcquireSession(TinioSession.Incoming, remote_addr, app_data)
                 }
                 sock.send(JSON.stringify(ack))
                 const ses = TinioSession[kCreateSession](remote_addr, TinioSession.Incoming, sock, this, this._delegate)
@@ -353,7 +353,7 @@ export class Tinio {
                 try{
                     const req : SessionRequest = {
                         cmd: 'session-request',
-                        data: await this._delegate.onAquireSession(peer, info)
+                        data: await this._delegate.onAcquireSession(TinioSession.Outgoing, peer, info)
                     }
                     sock.send(JSON.stringify(req));
                     (sock as any).tid = setTimeout(()=>{
@@ -377,7 +377,7 @@ export class Tinio {
                 try{
                     const ack = JSON.parse(event.data.toString()) as SessionAck
                     if(ack.cmd === 'session-ack'){
-                        const app_data = await this._delegate.onValidateSession(peer, ack.data, info)
+                        const app_data = await this._delegate.onValidateSession(TinioSession.Outgoing, peer, ack.data, info)
                         clearTimeout((sock as any).tid)
                         const ses = TinioSession[kCreateSession](peer, TinioSession.Outgoing, sock, this, this._delegate)
                         ses.data = app_data
