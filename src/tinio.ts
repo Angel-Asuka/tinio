@@ -3,6 +3,7 @@ import https from 'https'
 import { randomUUID } from 'crypto'
 import { SessionRequest, SessionAck, Msg, Req, Ack } from './protocol.js'
 import { apply_from } from '@acsl/toolbox'
+import { AcslError } from '@acsl/error'
 
 const kCreateSession = Symbol()
 const kRemoveSession = Symbol()
@@ -19,52 +20,11 @@ export type TinioListenParams = {
 
 export type TinioDelegate = {
     onAquireSession: (peer:string, info:any)=>Promise<any>
-    onValidateSession: (peer:string, data:any, info:any)=>Promise<boolean>
+    onValidateSession: (peer:string, data:any, info:any)=>Promise<any>
     onSessionEstablished: (session: TinioSession)=>Promise<void>
     onSessionTerminated: (session: TinioSession)=>void
     onMessage: (session: TinioSession, message: string, data?: Record<string, unknown>)=>Promise<Record<string, unknown>|void>
-    onError: (err: TinioError)=>void
-}
-
-const TinioErrorMessages = [
-    'Unknown error',            // Unknown
-    'Reject by peer',           // Reject
-    'Invalid data',             // InvalidData origin = any
-    'Connection Reset',         // Reset origin = WebSocket.CloseEvent
-    'Connection Error',         // Error origin = WebSocket.ErrorEvent
-    'Timeout',                  // Timeout
-    'Canceled',                 // Canceled
-    'Application error'         // AppError
-]
-
-export class TinioError extends Error {
-    reason: number
-    message: string
-    peer: string
-    data?: any
-    session?: TinioSession
-    origin?: Error | WebSocket.CloseEvent | WebSocket.ErrorEvent | any
-
-    constructor(reason: number, peer:string, data?: any, ses?: TinioSession, origin?: Error | WebSocket.CloseEvent | WebSocket.ErrorEvent | any){
-        reason = reason < 0 || reason >= TinioErrorMessages.length ? 0 : reason
-        super(`TinioError: ${TinioErrorMessages[reason]}`)
-        this.name = 'TinioError'
-        this.reason = reason
-        this.message = TinioErrorMessages[reason]
-        this.peer = peer
-        this.data = data
-        this.session = ses
-        this.origin = origin
-    }
-
-    static readonly Unknown         = 0
-    static readonly Reject          = 1
-    static readonly InvalidData     = 2
-    static readonly Reset           = 3
-    static readonly Error           = 4
-    static readonly Timeout         = 5
-    static readonly Canceled        = 6
-    static readonly AppError        = 7
+    onError: (err: AcslError)=>void
 }
 
 export class TinioSession {
@@ -125,13 +85,13 @@ export class TinioSession {
                     }
                 }else{
                     // Otherwise, ignore the message
-                    this._delegate.onError(new TinioError(TinioError.InvalidData, this._peer, msg, this))
+                    this._delegate.onError(new AcslError(AcslError.InvalidData, `Received a invalid package from ${this._peer}`, {peer: this._peer, ses: this, msg}))
                 }
             }catch(e){
-                this._delegate.onError(new TinioError(TinioError.AppError, this._peer, msg, this, e))
+                this._delegate.onError(new AcslError(AcslError.AppError, undefined, undefined, e as Error))
             }
         }catch(e){
-            this._delegate.onError(new TinioError(TinioError.InvalidData, this._peer, event.data, this, e))
+            this._delegate.onError(new AcslError(AcslError.InvalidData, `Received a invalid package from ${this._peer}`, {peer: this._peer, ses: this, msg:event.data}, e as Error))
         }
     }
 
@@ -140,7 +100,7 @@ export class TinioSession {
     }
 
     /** @internal */ private async _onError(event: WebSocket.ErrorEvent) {
-        this._delegate.onError(new TinioError(TinioError.Error, this._peer, undefined, this, event))
+        this._delegate.onError(new AcslError(AcslError.TinioWebSocketError, undefined, {peer: this._peer, ses: this, err: event}))
         return this.terminate()
     }
 
@@ -151,14 +111,14 @@ export class TinioSession {
         try{
             const msg = JSON.stringify(pkg)
             if(this._sock == null || this._sock.readyState !== WebSocket.WebSocket.OPEN){
-                throw new TinioError(TinioError.Reset, this._peer, pkg, this)
+                throw new AcslError(AcslError.TinioReset, undefined, {peer:this._peer, ses:this})
             }
             await this._sock.send(msg)
         }catch(e){
-            if(e instanceof TinioError){
+            if(e instanceof AcslError){
                 throw e
             }else{
-                throw new TinioError(TinioError.InvalidData, this._peer, pkg, this, e)
+                this._delegate.onError(new AcslError(AcslError.InvalidData, 'Can not stringify data', {peer: this._peer, ses: this, msg:pkg}))
             }
         }
     }
@@ -197,7 +157,7 @@ export class TinioSession {
         const p = new Promise((resolve, reject) => {
             const tid = setTimeout(() => {
                 this._reqs.delete(rid)
-                reject(new TinioError(TinioError.Timeout, this._peer, data, this))
+                reject(new AcslError(AcslError.Timeout, undefined, {peer:this._peer, ses:this, msg:msg, data:data}))
             }, this._tinio.requestTimeout)
             const solve = (data: any) => {
                 clearTimeout(tid)
@@ -271,11 +231,11 @@ export class Tinio {
     /** @internal */ private _delegate : TinioDelegate = {
         /* eslint-disable @typescript-eslint/no-empty-function */
         onAquireSession: async (_peer:string)=>{},
-        onValidateSession: async (_peer:string, _data:any)=>{ return true },
+        onValidateSession: async (_peer:string, _data:any)=>{},
         onSessionEstablished: async (_session: TinioSession)=>{},
         onSessionTerminated: async (_session: TinioSession)=>{},
         onMessage: async (_session: TinioSession, _message: string, _data?: Record<string, unknown>)=>{},
-        onError: (_err: TinioError)=>{}
+        onError: (_err: AcslError)=>{}
         /* eslint-enable @typescript-eslint/no-empty-function */
     }
 
@@ -315,20 +275,18 @@ export class Tinio {
             }
             try{
                 const event: WebSocket.MessageEvent = await new Promise((resolve, reject)=>{
-                    const tid = setTimeout(()=>reject(new TinioError(TinioError.Timeout, remote_addr)), this._connect_timeout)
+                    const tid = setTimeout(()=>reject(new AcslError(AcslError.Timeout, undefined, {peer:remote_addr})), this._connect_timeout)
                     sock.onmessage = (event: WebSocket.MessageEvent)=>(clearTimeout(tid), resolve(event))
-                    sock.onerror = (event: WebSocket.ErrorEvent)=>(clearTimeout(tid), reject(new TinioError(TinioError.Error, remote_addr, undefined, undefined, event)))
-                    sock.onclose = (event: WebSocket.CloseEvent)=>(clearTimeout(tid), reject(new TinioError(TinioError.Reset, remote_addr, undefined, undefined, event)))
+                    sock.onerror = (event: WebSocket.ErrorEvent)=>(clearTimeout(tid), reject(new AcslError(AcslError.TinioWebSocketError, undefined, {peer: remote_addr,err: event})))
+                    sock.onclose = (event: WebSocket.CloseEvent)=>(clearTimeout(tid), reject(new AcslError(AcslError.TinioReset, undefined, {peer: remote_addr,event:event})))
                 })
 
                 const msg = JSON.parse(event.data.toString()) as SessionRequest
                 if(msg.cmd !== 'session-request'){
-                    throw new TinioError(TinioError.InvalidData, remote_addr, msg)
+                    throw new AcslError(AcslError.InvalidData, `Invalid package from ${remote_addr} in handshaking`, {peer:remote_addr, msg:event.data})
                 }
 
-                if(await this._delegate.onValidateSession(remote_addr, msg.data, undefined) === false){
-                    throw new TinioError(TinioError.Canceled, remote_addr, msg)
-                }
+                const app_data = await this._delegate.onValidateSession(remote_addr, msg.data, undefined)
 
                 const ack: SessionAck = {
                     cmd: 'session-ack',
@@ -336,15 +294,16 @@ export class Tinio {
                 }
                 sock.send(JSON.stringify(ack))
                 const ses = TinioSession[kCreateSession](remote_addr, TinioSession.Incoming, sock, this, this._delegate)
+                ses.data = app_data
                 this._connections.set(ses.uuid, ses)
                 await this._delegate.onSessionEstablished(ses)
 
             }catch(e){
                 sock.close()
-                if(e instanceof TinioError){
+                if(e instanceof AcslError){
                     this._delegate.onError(e)
                 }else{
-                    this._delegate.onError(new TinioError(TinioError.Error, remote_addr, undefined, undefined, e))
+                    this._delegate.onError(new AcslError(AcslError.Unknown, undefined, undefined, e as Error))
                 }
             }
         })
@@ -400,12 +359,12 @@ export class Tinio {
                     (sock as any).tid = setTimeout(()=>{
                         sock.removeAllListeners()
                         sock.close()
-                        reject(new TinioError(TinioError.Timeout, peer))
+                        reject(new AcslError(AcslError.Timeout, undefined, {peer}))
                     }, this._connect_timeout)
                 }catch(e){
                     sock.removeAllListeners()
                     sock.close()
-                    reject(new TinioError(TinioError.Unknown, peer, undefined, undefined, e))
+                    reject(new AcslError(AcslError.Unknown, undefined, undefined, e as Error))
                 }
             }
             const close_reject = (reason: any)=>{
@@ -418,28 +377,27 @@ export class Tinio {
                 try{
                     const ack = JSON.parse(event.data.toString()) as SessionAck
                     if(ack.cmd === 'session-ack'){
-                        if(await this._delegate.onValidateSession(peer, ack.data, info) == false){
-                            close_reject(new TinioError(TinioError.Canceled, peer))
-                        }
+                        const app_data = await this._delegate.onValidateSession(peer, ack.data, info)
                         clearTimeout((sock as any).tid)
                         const ses = TinioSession[kCreateSession](peer, TinioSession.Outgoing, sock, this, this._delegate)
+                        ses.data = app_data
                         this._connections.set(ses.uuid, ses)
                         await this._delegate.onSessionEstablished(ses)
                         resolve(ses)
                     } else if(ack.cmd === 'session-reject'){
-                        close_reject(new TinioError(TinioError.Reject, peer, ack.data))
+                        close_reject(new AcslError(AcslError.TinioReject, peer, {peer: peer, data: ack}))
                     } else {
-                        close_reject(new TinioError(TinioError.InvalidData, peer, event.data))
+                        close_reject(new AcslError(AcslError.InvalidData, `Invalid package from ${peer} in handshaking`, {peer:peer, msg:ack}))
                     }
                 }catch(e){
-                    close_reject(new TinioError(TinioError.InvalidData, peer, event.data, undefined, e))
+                    close_reject(new AcslError(AcslError.InvalidData, `Invalid package from ${peer} in handshaking`, {peer:peer, msg:event.data}))
                 }
             }
             sock.onerror = (event: WebSocket.ErrorEvent)=>{
-                close_reject(new TinioError(TinioError.Error, peer, undefined, undefined, event))
+                close_reject(new AcslError(AcslError.TinioWebSocketError, undefined, {peer, error: event}))
             }
             sock.onclose = (event: WebSocket.CloseEvent)=>{
-                close_reject(new TinioError(TinioError.Reset, peer, undefined, undefined, event))
+                close_reject(new AcslError(AcslError.TinioReset, undefined, {peer, event}))
             }
         })
     }

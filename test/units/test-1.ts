@@ -20,7 +20,7 @@ export const testers = {
                 cp_validate_session_data_ok = true
             else
                 console.log('server-side onValidateSession data not ok', data)
-            return true
+            return "GOOD"
         }
         server.delegate.onAquireSession = async (peer: string) => {
             console.log('onAquireSession Triggered')
@@ -30,6 +30,7 @@ export const testers = {
         server.delegate.onSessionEstablished = async (ses: TinioSession) => {
             console.log('onSessionEstablished Triggered')
             cp_on_session_established = true
+            if(ses.data != "GOOD") throw new Error('session data not ok')
         }
         server.delegate.onMessage = async (ses: TinioSession, msg: string, data?: Record<string, unknown>) => {
             console.log('onMessage Triggered')

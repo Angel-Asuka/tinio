@@ -27,7 +27,7 @@ release:
     - npm run build
     - npm pack
     - if [ ! -z "$AVOID_RELEASE" ]; then echo "AVOID_RELEASE is set, skipping release"; exit 0; fi
-    - npm-try-publish
+    - npm-try-publish https://registry.npmjs.org
     - npm-try-publish https://nexus.afx.pub/repository/npm-host/
     - VERSION=$(node -p "require('./package.json').version")
     - TAGNAME=$CI_PROJECT_NAME-$VERSION
