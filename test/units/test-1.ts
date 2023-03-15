@@ -60,9 +60,11 @@ export const testers = {
             return false
         }
 
-        server.startListen({
+        await server.startListen({
             port: 18080,
         })
+
+        console.log(server.listenInfo)
 
         const clises = await client.aquireSession("ws://127.0.0.1:18080")
 

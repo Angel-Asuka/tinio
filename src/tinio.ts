@@ -241,6 +241,7 @@ export class Tinio {
 
     /** @internal */ private _listen_params : TinioListenParams = { port: 0 }
     /** @internal */ private _ws : WebSocket.Server | null = null
+    /** @internal */ private _listen_info? : TinioListenParams
 
     constructor(){
         
@@ -248,26 +249,44 @@ export class Tinio {
 
     /**
      * Start to accept session requests
-     * 
-     * @returns {boolean} true if the server started successfully
      */
-    startListen(params? : TinioListenParams): boolean {
+    async startListen(params? : TinioListenParams) {
         apply_from(this._listen_params, params)
         if(this._listen_params.port == null) this._listen_params.port = 0
 
+        const server_param = {} as any
+        
         if(this._listen_params.ssl){
             const server = https.createServer(this._listen_params.ssl)
-            this._ws = new WebSocket.Server({ server })
+            server_param.server = server
             server.listen(this._listen_params.port, this._listen_params.address)
         }else{
-            this._ws = new WebSocket.WebSocketServer({
-                host: this._listen_params.address,
-                port: this._listen_params.port,
-                path: this._listen_params.path
-            })
+            server_param.host = this._listen_params.address
+            server_param.port = this._listen_params.port
+            server_param.path = this._listen_params.path
         }
 
-        this._ws.on('connection', async (sock: WebSocket.WebSocket)=>{
+        const ws = new WebSocket.WebSocketServer(server_param)
+
+        await new Promise<void>((resolve, reject)=>{
+            ws.on('listening', ()=>{
+                const addr = ws.address() as WebSocket.AddressInfo
+                this._listen_info = {
+                    address: addr.address,
+                    port: addr.port,
+                    path: this._listen_params.path
+                }
+                ws.removeAllListeners()
+                resolve()
+            })
+            ws.on('error', (err: Error)=>{
+                ws.removeAllListeners()
+                ws.close()
+                reject(new AcslError(AcslError.TinioListenError , undefined, undefined, err))
+            })
+        })
+
+        ws.on('connection', async (sock: WebSocket.WebSocket)=>{
             const remote_addr = (sock as any)?._socket?.remoteAddress
             if(!remote_addr){
                 sock.close()
@@ -308,7 +327,7 @@ export class Tinio {
             }
         })
 
-        return true
+        this._ws = ws
     }
 
     /**
@@ -318,6 +337,7 @@ export class Tinio {
         if(this._ws){
             this._ws.close()
             this._ws = null
+            this._listen_info = undefined
         }
     }
 
@@ -405,9 +425,9 @@ export class Tinio {
     get delegate(): TinioDelegate { return this._delegate }
 
     /**
-     * Determine if the Tinio is listening
+     * Determine if the Tinio is listening, and retrieve the listen info
      */
-    get listening(): boolean { return false }
+    get listenInfo(): TinioListenParams | undefined { return this._listen_info }
 
     /**
      * Retrieve all alive sessions
