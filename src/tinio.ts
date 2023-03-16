@@ -287,10 +287,16 @@ export class Tinio {
         })
 
         ws.on('connection', async (sock: WebSocket.WebSocket)=>{
-            const remote_addr = (sock as any)?._socket?.remoteAddress
+            let remote_addr = (sock as any)?._socket?.remoteAddress
             if(!remote_addr){
                 sock.close()
                 return
+            }
+            // Check address type, wrap IPv6 address with [], transform IPv4-mapped IPv6 address to IPv4 address
+            if(/^::ffff:/.test(remote_addr)){
+                remote_addr = remote_addr.replace(/^::ffff:/, '')
+            } else if(remote_addr.includes(':')){
+                remote_addr = `[${remote_addr}]`
             }
             try{
                 const event: WebSocket.MessageEvent = await new Promise((resolve, reject)=>{
